@@ -114,6 +114,76 @@ def sample_gnfw(n_part, gamma=1.2, r_s=PT.R_S, r_max=40.0, q_vert=1.0,
     return pos, np.full(n_part, 1.0 / n_part)
 
 
+def read_particles(path, centre=None, dm_only=True):
+    """Read a HESTIA particle file.
+
+    HESTIA is run with AREPO, whose snapshots are Gadget-style HDF5, so the
+    expected layout is PartType1/Coordinates and PartType1/Masses with a
+    Header carrying BoxSize and MassTable. That is an informed guess, not a
+    read of Muru's readme, so the loader sniffs the file and says what it
+    found rather than assuming. Plain .npy and whitespace text with four
+    columns are handled too.
+
+    Returns (pos_kpc, mass) with the halo centred on the origin and the
+    coordinate convention project_template expects.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".hdf5", ".h5"):
+        import h5py
+        with h5py.File(path, "r") as f:
+            keys = list(f.keys())
+            pt = "PartType1" if "PartType1" in f else None
+            if pt is None:
+                cand = [k for k in keys if k.lower().startswith("parttype")]
+                if not cand:
+                    raise SystemExit(
+                        f"{path}: no PartType group. Top-level keys are "
+                        f"{keys}. Send me the readme and I will match it.")
+                pt = sorted(cand)[0] if not dm_only else cand[0]
+            g = f[pt]
+            if "Coordinates" not in g:
+                raise SystemExit(f"{path}: {pt} has {list(g.keys())}, no "
+                                 f"Coordinates. Send me the readme.")
+            pos = np.asarray(g["Coordinates"], float)
+            if "Masses" in g:
+                mass = np.asarray(g["Masses"], float)
+            else:
+                mt = f["Header"].attrs.get("MassTable")
+                idx = int(pt.replace("PartType", ""))
+                mass = np.full(len(pos), float(mt[idx]) if mt is not None
+                               else 1.0)
+            print(f"  {os.path.basename(path)}: {pt}, {len(pos):,} particles")
+    elif ext == ".npy":
+        a = np.load(path)
+        pos, mass = a[:, :3].astype(float), (a[:, 3].astype(float)
+                                             if a.shape[1] > 3
+                                             else np.ones(len(a)))
+    else:
+        a = np.loadtxt(path)
+        pos, mass = a[:, :3].astype(float), (a[:, 3].astype(float)
+                                             if a.shape[1] > 3
+                                             else np.ones(len(a)))
+
+    if centre is None:
+        # shrinking-sphere centre: robust to the box offset and to a second
+        # halo sitting in the same truncated file
+        c = np.median(pos, axis=0)
+        r_cut = np.percentile(np.linalg.norm(pos - c, axis=1), 90)
+        for _ in range(40):
+            d = np.linalg.norm(pos - c, axis=1)
+            sel = d < r_cut
+            if sel.sum() < 200:
+                break
+            c = np.average(pos[sel], axis=0, weights=mass[sel])
+            r_cut *= 0.9
+        centre = c
+        print(f"    centred on {np.round(centre, 3)} (shrinking sphere)")
+    pos = pos - np.asarray(centre, float)
+    print(f"    extent after centring: "
+          f"{np.round(np.abs(pos).max(axis=0), 1)} (units as in the file)")
+    return pos, mass
+
+
 def selftest(verbose=True):
     """Particles from a known halo must reproduce that halo's analytic J map.
 
@@ -201,8 +271,26 @@ def main():
     a = ap.parse_args()
     if not a.particles:
         return 0 if selftest() else 1
-    raise SystemExit("particle reader not written yet - needs Muru's readme "
-                     "for the file layout. Self-test runs without it.")
+    import hestia_to_template as H
+    pos, mass = read_particles(a.particles)
+    rho, h = density_grid(pos, mass, a.half_kpc, a.cells,
+                          smooth_cells=a.smooth_cells)
+    j = PT.normalise(jmap(rho, h, a.half_kpc, s_max=a.s_max))
+    col = jmap(rho, h, a.half_kpc, s_max=a.s_max, square=False)
+    dm2 = PT.normalise(col ** 2)
+    j1 = PT.smooth_to(j, 1.0)
+    d1 = PT.smooth_to(dm2, 1.0)
+    print(f"\n  at 1 deg smoothing, 5% contour:")
+    print(f"    q from int rho^2 ds  (J-factor)   {H.axis_ratio(j1, 0.05):.3f}")
+    print(f"    q from (int rho ds)^2 (Muru dm2)  {H.axis_ratio(d1, 0.05):.3f}")
+    if a.out:
+        PT.write_fits(j1, a.out, "jfactor_rho2",
+                      {"SRC": os.path.basename(a.particles),
+                       "CELLS": a.cells, "HALFKPC": a.half_kpc,
+                       "SMOOTH": a.smooth_cells, "SMAXKPC": a.s_max,
+                       "QUANTITY": "int rho^2 ds, 1 deg smoothed"})
+        print(f"  wrote {a.out}")
+    return 0
 
 
 if __name__ == "__main__":
