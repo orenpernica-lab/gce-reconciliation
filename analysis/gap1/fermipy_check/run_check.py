@@ -89,6 +89,12 @@ def main():
             "Send the traceback above with the log. The usual cause is fermipy "
             "and fermitools being different versions in the same env, not a "
             "missing package.")
+    except ImportError:
+        raise SystemExit(
+            "fermipy is not installed in this environment.\n"
+            "  conda activate fermi\n"
+            "  conda install -c conda-forge fermipy\n"
+            "then run this again.")
 
     gta = GTAnalysis(a.config, logging={"verbosity": 3})
     gta.setup()
